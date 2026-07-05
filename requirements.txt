@@ -2,3 +2,7 @@ flask>=3.0.0
 flask-limiter>=3.5.0
 groq==0.15.0
 python-dotenv==1.0.1
+
+# Frontend (extra feature) — Gradio UI that calls the Flask API
+gradio>=4.44.0
+requests>=2.31.0
