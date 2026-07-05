@@ -122,6 +122,13 @@ Three metrics, each normalized to an AI-likelihood subscore in `[0,1]`, then ave
 | **Punctuation variety** — count of distinct marks used from `{, ; : — ( ) " ' ! ? …}` | expressive range | humans use more varied punctuation; AI is plainer | `sub = clamp((3 − distinct) / 3, 0, 1)` |
 | **Lexical diversity (TTR)** — unique words / total words (on a fixed window) | vocabulary richness | extreme uniformity reads AI-ish | `sub = clamp((0.45 − TTR) / (0.45 − 0.20), 0, 1)` |
 
+> **⚠️ Note — re-tuned in Milestone 4 (as-built differs from this original design).** The
+> stylometry metrics were calibrated against a labeled sample set. **TTR was dropped** (on
+> real data its direction was reversed — AI had *higher* diversity than long human essays,
+> which would cause false positives), the burstiness band was recalibrated, weights were set
+> to burstiness 0.75 / punctuation 0.25, and `MIN_WORDS` was raised 40 → 60. See the
+> **Calibration & Tuning** section of the README for the as-built values and evidence.
+
 - **Output shape:** `sty_score ∈ [0,1]` plus the raw metric values (kept for the audit log).
 - **Blind spot:** needs length to be stable; **genre-blind** — poetry, lists, and technical
   writing violate its assumptions, so a real human poem can look "too uniform." It ignores

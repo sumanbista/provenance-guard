@@ -11,25 +11,14 @@ import uuid
 from flask import Flask, request, jsonify
 
 from detection.llm_signal import classify_llm
+from detection.stylometry import stylometry
+from detection.scoring import score
 from db import init_db, log_submission, recent_entries
 
 app = Flask(__name__)
 
 # Create the audit_log table on startup (no-op if it already exists).
 init_db()
-
-
-def _attribution_from_signal1(llm_score: float) -> str:
-    """Preliminary human/AI leaning from signal 1 ALONE.
-
-    This is a placeholder verdict for Milestone 3 — the real, asymmetric
-    verdict logic (which requires two signals to agree before saying "AI")
-    lands in Milestone 4. For now we just report which way the single signal
-    leans so we can inspect end-to-end flow.
-    """
-    if llm_score >= 0.5:
-        return "likely-ai"
-    return "likely-human"
 
 
 @app.get("/health")
@@ -70,19 +59,25 @@ def submit():
 
     content_id = str(uuid.uuid4())
 
-    # --- Signal 1: LLM-as-judge ---
-    llm = classify_llm(text)
-    attribution = _attribution_from_signal1(llm["llm_score"])
-    confidence = 0.5  # placeholder — real scoring in Milestone 4
+    # --- Detection pipeline: two independent signals ---
+    llm = classify_llm(text)              # signal 1 (semantic)
+    sty = stylometry(text)                # signal 2 (structural)
+    word_count = sty["metrics"]["word_count"]
+
+    # --- Confidence scoring: combine both signals ---
+    result = score(llm["llm_score"], sty["sty_score"], word_count)
+    attribution = result["attribution"]
+    confidence = result["confidence"]
     status = "classified"
 
-    # --- Audit log: one structured row per decision ---
+    # --- Audit log: one structured row, capturing BOTH signal scores ---
     log_submission(
         content_id=content_id,
         creator_id=creator_id,
         attribution=attribution,
         confidence=confidence,
         llm_score=llm["llm_score"],
+        sty_score=sty["sty_score"],
         status=status,
     )
 
@@ -91,12 +86,22 @@ def submit():
         "creator_id": creator_id,
         "attribution": attribution,
         "confidence": confidence,
-        "label": "Placeholder label — full confidence scoring and labels arrive in Milestone 4.",
+        "label": "Placeholder label — transparency labels arrive in Milestone 5.",
         "signals": {
             "llm": {
                 "llm_score": llm["llm_score"],
                 "reason": llm["reason"],
-            }
+            },
+            "stylometry": {
+                "sty_score": sty["sty_score"],
+                "metrics": sty["metrics"],
+            },
+        },
+        "scoring": {
+            "p_ai": result["p_ai"],
+            "agreement": result["agreement"],
+            "direction": result["direction"],
+            "too_short": result["too_short"],
         },
         "status": status,
     })

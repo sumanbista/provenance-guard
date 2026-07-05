@@ -40,10 +40,15 @@ def init_db() -> None:
                 attribution TEXT,
                 confidence  REAL,
                 llm_score   REAL,
+                sty_score   REAL,
                 status      TEXT
             )
             """
         )
+        # Migrate older databases created before sty_score existed.
+        cols = [r["name"] for r in conn.execute("PRAGMA table_info(audit_log)").fetchall()]
+        if "sty_score" not in cols:
+            conn.execute("ALTER TABLE audit_log ADD COLUMN sty_score REAL")
 
 
 def _utc_now_iso() -> str:
@@ -58,9 +63,14 @@ def log_submission(
     attribution: str,
     confidence: float,
     llm_score: float,
+    sty_score: float,
     status: str,
 ) -> dict:
-    """Append one submission decision to the audit log. Returns the row written."""
+    """Append one submission decision to the audit log. Returns the row written.
+
+    Captures BOTH signals' individual scores (llm_score, sty_score) alongside the
+    combined confidence, so a reviewer can see exactly why a verdict was reached.
+    """
     entry = {
         "content_id": content_id,
         "creator_id": creator_id,
@@ -69,6 +79,7 @@ def log_submission(
         "attribution": attribution,
         "confidence": confidence,
         "llm_score": llm_score,
+        "sty_score": sty_score,
         "status": status,
     }
     with _connect() as conn:
@@ -76,9 +87,9 @@ def log_submission(
             """
             INSERT INTO audit_log
                 (content_id, creator_id, timestamp, event, attribution,
-                 confidence, llm_score, status)
+                 confidence, llm_score, sty_score, status)
             VALUES (:content_id, :creator_id, :timestamp, :event, :attribution,
-                    :confidence, :llm_score, :status)
+                    :confidence, :llm_score, :sty_score, :status)
             """,
             entry,
         )
