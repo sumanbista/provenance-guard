@@ -41,14 +41,43 @@ def init_db() -> None:
                 confidence  REAL,
                 llm_score   REAL,
                 sty_score   REAL,
-                status      TEXT
+                status      TEXT,
+                appeal_reasoning TEXT
             )
             """
         )
-        # Migrate older databases created before sty_score existed.
+        # submissions: current mutable state + the original decision, keyed by content_id.
+        conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS submissions (
+                content_id  TEXT PRIMARY KEY,
+                creator_id  TEXT,
+                timestamp   TEXT NOT NULL,
+                attribution TEXT,
+                confidence  REAL,
+                llm_score   REAL,
+                sty_score   REAL,
+                status      TEXT NOT NULL
+            )
+            """
+        )
+        # appeals: one structured record per appeal (the appeal queue).
+        conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS appeals (
+                appeal_id        TEXT PRIMARY KEY,
+                content_id       TEXT NOT NULL,
+                creator_reasoning TEXT NOT NULL,
+                timestamp        TEXT NOT NULL
+            )
+            """
+        )
+        # Migrate older databases created before these columns existed.
         cols = [r["name"] for r in conn.execute("PRAGMA table_info(audit_log)").fetchall()]
         if "sty_score" not in cols:
             conn.execute("ALTER TABLE audit_log ADD COLUMN sty_score REAL")
+        if "appeal_reasoning" not in cols:
+            conn.execute("ALTER TABLE audit_log ADD COLUMN appeal_reasoning TEXT")
 
 
 def _utc_now_iso() -> str:
@@ -81,18 +110,105 @@ def log_submission(
         "llm_score": llm_score,
         "sty_score": sty_score,
         "status": status,
+        "appeal_reasoning": None,
     }
+    _insert_audit(entry)
+    return entry
+
+
+def _insert_audit(entry: dict) -> None:
+    """Insert one row into audit_log. `entry` must contain all logged columns."""
     with _connect() as conn:
         conn.execute(
             """
             INSERT INTO audit_log
                 (content_id, creator_id, timestamp, event, attribution,
-                 confidence, llm_score, sty_score, status)
+                 confidence, llm_score, sty_score, status, appeal_reasoning)
             VALUES (:content_id, :creator_id, :timestamp, :event, :attribution,
-                    :confidence, :llm_score, :sty_score, :status)
+                    :confidence, :llm_score, :sty_score, :status, :appeal_reasoning)
             """,
             entry,
         )
+
+
+def insert_submission(
+    *,
+    content_id: str,
+    creator_id: str | None,
+    attribution: str,
+    confidence: float,
+    llm_score: float,
+    sty_score: float,
+    status: str,
+) -> None:
+    """Store the current state + original decision for a submission."""
+    with _connect() as conn:
+        conn.execute(
+            """
+            INSERT INTO submissions
+                (content_id, creator_id, timestamp, attribution, confidence,
+                 llm_score, sty_score, status)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (content_id, creator_id, _utc_now_iso(), attribution, confidence,
+             llm_score, sty_score, status),
+        )
+
+
+def get_submission(content_id: str) -> dict | None:
+    """Return the submission row for a content_id, or None if it doesn't exist."""
+    with _connect() as conn:
+        row = conn.execute(
+            "SELECT * FROM submissions WHERE content_id = ?", (content_id,)
+        ).fetchone()
+    return dict(row) if row else None
+
+
+def update_submission_status(content_id: str, status: str) -> None:
+    """Update the mutable status of a submission (e.g. -> 'under_review')."""
+    with _connect() as conn:
+        conn.execute(
+            "UPDATE submissions SET status = ? WHERE content_id = ?",
+            (status, content_id),
+        )
+
+
+def record_appeal(
+    *,
+    appeal_id: str,
+    content_id: str,
+    creator_reasoning: str,
+    original: dict,
+) -> dict:
+    """Record an appeal: insert the appeal row, flip the submission status to
+    'under_review', and log an appeal event in the audit log ALONGSIDE the
+    original decision (attribution/confidence/scores copied from `original`).
+
+    Returns the audit-log entry written.
+    """
+    with _connect() as conn:
+        conn.execute(
+            """
+            INSERT INTO appeals (appeal_id, content_id, creator_reasoning, timestamp)
+            VALUES (?, ?, ?, ?)
+            """,
+            (appeal_id, content_id, creator_reasoning, _utc_now_iso()),
+        )
+    update_submission_status(content_id, "under_review")
+
+    entry = {
+        "content_id": content_id,
+        "creator_id": original.get("creator_id"),
+        "timestamp": _utc_now_iso(),
+        "event": "appeal",
+        "attribution": original.get("attribution"),
+        "confidence": original.get("confidence"),
+        "llm_score": original.get("llm_score"),
+        "sty_score": original.get("sty_score"),
+        "status": "under_review",
+        "appeal_reasoning": creator_reasoning,
+    }
+    _insert_audit(entry)
     return entry
 
 

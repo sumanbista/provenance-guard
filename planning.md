@@ -56,7 +56,7 @@ SUBMISSION FLOW
 
 
 APPEAL FLOW
-   {content_id, reason} ─POST /appeal─▶┌────────────────────┐
+   {content_id, creator_reasoning} ─POST /appeal─▶┌──────────────┐
                                        │  SQLite database   │
                                        │  lookup submission │
                                        │  insert appeal     │
@@ -77,7 +77,7 @@ SQLite `audit_log` before the structured JSON response is returned.
 
 **Appeal flow (narrative).** A `POST /appeal` request looks up the original submission by
 `content_id`, records the creator's reasoning in the `appeals` table, flips the submission's
-status to `under review`, and appends an appeal event to the `audit_log` — so the appeal
+status to `under_review`, and appends an appeal event to the `audit_log` — so the appeal
 always lives next to the decision it contests. No automated re-classification happens; a
 human reviewer takes it from there.
 
@@ -230,15 +230,15 @@ canonical record for grading.)*
 - **Who can appeal:** the creator of the content — identified by the `content_id` returned at
   submission (and an optional `creator_id`). Anyone holding the `content_id` for a piece may
   contest its classification.
-- **What they provide:** `content_id`, a free-text `reason` explaining why they believe the
+- **What they provide:** `content_id`, a free-text `creator_reasoning` explaining why they believe the
   classification is wrong, and optionally a `creator_id`.
 - **What the system does on receipt of an appeal:**
   1. Look up the original submission by `content_id`; return `404` if it doesn't exist.
-  2. Insert a row into `appeals` (`appeal_id`, `content_id`, `reason`, `creator_id`, timestamp).
-  3. Update the submission's `status` from `classified` → **`under review`**.
+  2. Insert a row into `appeals` (`appeal_id`, `content_id`, `creator_reasoning`, timestamp).
+  3. Update the submission's `status` from `classified` → **`under_review`**.
   4. Append an `audit_log` event `{event: "appeal"}` containing the reason and a reference to
      the original decision, so the appeal is stored *next to* what it contests.
-  5. Return `{content_id, appeal_id, status: "under review"}`.
+  5. Return `{content_id, appeal_id, status: "under_review"}`.
 - **What a human reviewer sees in the appeal queue:** for each appeal — the original text, the
   original verdict, its confidence, **both signal scores** (so they can see *why* the system
   decided what it did), the creator's stated reason, the timestamps, and the current status.
@@ -277,12 +277,13 @@ Specific scenarios the system will handle poorly, and how the design responds:
 
 ## API Surface (contract)
 
-The server runs on **port 5001** (macOS AirPlay Receiver occupies the Flask default of 5000).
+The server runs on **port 5000** by default (configurable via the `PORT` env var). On macOS,
+disable "AirPlay Receiver" to free port 5000, or run with `PORT=5001`.
 
 | Method | Endpoint | Accepts | Returns |
 |--------|----------|---------|---------|
 | `POST` | `/submit` | `{ "text": str, "creator_id"?: str }` (also accepts `"content"` as an alias) | `{ content_id, attribution, confidence, label, signals: {llm, stylometry}, status }` |
-| `POST` | `/appeal` | `{ "content_id": str, "reason": str, "creator_id"?: str }` | `{ content_id, appeal_id, status: "under review" }` |
+| `POST` | `/appeal` | `{ "content_id": str, "creator_reasoning": str }` | `{ content_id, appeal_id, status: "under_review", message }` |
 | `GET`  | `/log` | — | `{ "entries": [...] }` — recent `audit_log` rows, newest first (≥3 for grading) |
 | `GET`  | `/status/<content_id>` | — | current status + stored decision *(optional convenience)* |
 | `GET`  | `/health` | — | liveness check |
@@ -326,6 +327,6 @@ to generate, and how I verify the result before moving on.
   generator (the three variants), the SQLite schema + audit logging, Flask-Limiter config on
   `/submit`, and the `POST /appeal`, `GET /log` endpoints.
 - **Verify:** craft inputs that reach **all three** label variants; confirm an appeal flips
-  status to `under review` and writes both an `appeals` row and an `audit_log` event; confirm
+  status to `under_review` and writes both an `appeals` row and an `audit_log` event; confirm
   the rate limit returns `429` when exceeded; confirm `GET /log` shows ≥3 structured entries.
 

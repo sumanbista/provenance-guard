@@ -14,9 +14,27 @@ load_dotenv()
 GROQ_API_KEY = os.getenv("GROQ_API_KEY")
 LLM_MODEL = os.getenv("LLM_MODEL", "llama-3.3-70b-versatile")
 
+# --- Server ---
+# Defaults to port 5000. On macOS, free it first by turning OFF "AirPlay Receiver"
+# (System Settings > General > AirDrop & Handoff). If you can't, run with PORT=5001.
+HOST = os.getenv("HOST", "127.0.0.1")
+PORT = int(os.getenv("PORT", "5000"))
+DEBUG = os.getenv("FLASK_DEBUG", "1") == "1"
+
 # --- Storage ---
 # SQLite database file (holds the audit_log table; submissions/appeals added later).
 DB_PATH = os.getenv("DB_PATH", "provenance.db")
+
+# --- Rate limiting (Flask-Limiter) ---
+# In-memory storage is fine for local/dev; a real deployment would use Redis.
+RATE_LIMIT_STORAGE_URI = "memory://"
+# Applied to POST /submit. See the README "Rate Limiting" section for the reasoning.
+# Tuned to a real writer's cadence (submissions are naturally minutes apart), with
+# layered burst/session/total caps that also bound Groq LLM cost (1 call per submit):
+#   5/min  : burst  — a writer resubmitting after edits stays under; a flood script trips it.
+#   30/hour: session — a heavy-but-legit drafting session fits; blocks paced abuse.
+#   100/day: total  — bounds daily LLM cost; no writer analyzes 100 distinct pieces a day.
+RATE_LIMIT_SUBMIT = "5 per minute; 30 per hour; 100 per day"
 
 # --- Detection tunables (see planning.md §1–§2) ---
 # When an LLM call fails or its output can't be parsed, we fail CLOSED to this
