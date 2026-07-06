@@ -18,6 +18,39 @@ Full architecture, flow diagrams, and design rationale live in [planning.md](pla
 
 ---
 
+## Architecture Overview
+
+The path a single submission takes from raw text to a transparency label:
+
+```
+POST /submit ─▶ Rate Limiter ─▶ Validator ─▶ Detection Pipeline ─▶ Confidence ─▶ Label ─▶ Response
+  {text}         (429 if over)   (assigns      ├─ Signal 1: LLM      Scorer        Generator   {attribution,
+                                  content_id)   └─ Signal 2: Stylo.   (combine →                confidence,
+                                        │        each → score∈[0,1]   verdict+conf)             label, signals}
+                                        │                                    │
+                                        └────────────────────────────▶ SQLite audit_log ◀── GET /log
+                                                                       + submissions row
+
+POST /appeal ─▶ look up submission ─▶ status → under_review ─▶ audit_log (appeal event) ─▶ Response
+```
+
+1. **`POST /submit`** passes through the **rate limiter** (429 if over quota) and a **length
+   validator** (assigns a `content_id`).
+2. The **detection pipeline** runs two independent signals — an LLM-as-judge (semantic) and
+   stylometry (structural) — each emitting an AI-likelihood in `[0,1]`.
+3. The **confidence scorer** blends them into a single verdict + confidence (applying the
+   false-positive asymmetry), the **label generator** picks one of three transparency labels,
+   and the whole decision is written to the SQLite **audit log** before the JSON response.
+4. **`POST /appeal`** looks up a submission, flips its status to `under_review`, and logs an
+   appeal event next to the original decision — no automated re-classification.
+
+The pieces map to files: [app.py](app.py) (API + orchestration),
+[detection/llm_signal.py](detection/llm_signal.py), [detection/stylometry.py](detection/stylometry.py),
+[detection/scoring.py](detection/scoring.py), [labels.py](labels.py), [db.py](db.py) (SQLite),
+[config.py](config.py) (tunables). A Gradio frontend ([ui.py](ui.py)) is an optional extra.
+
+---
+
 ## Setup & Running
 
 ```bash
@@ -48,6 +81,20 @@ python app.py        # serves on http://localhost:5000
 | `POST` | `/appeal` | Contest a classification. Body: `{ "content_id": str, "creator_reasoning": str }`. Sets status to `under_review` and logs the appeal. |
 | `GET`  | `/log` | Recent audit-log entries as JSON (`{ "entries": [...] }`) |
 | `GET`  | `/health` | Liveness check |
+
+### Frontend (optional extra)
+
+A Gradio UI ([ui.py](ui.py)) visualizes every feature. Run the backend, then in a second
+terminal run the UI pointed at it:
+
+```bash
+python ui.py                                   # if backend is on :5000
+API_BASE=http://localhost:5001 python ui.py    # if backend is on :5001
+```
+
+It opens on http://localhost:7860 with an **Analyze** tab (label card, confidence meter, both
+signal scores, appeal panel) and an **Audit Log** tab. It calls the live API over HTTP, so it
+exercises the real endpoints — including rate limiting.
 
 ---
 
@@ -121,6 +168,30 @@ Note the asymmetry: declaring **AI** needs a *higher* confidence (0.75) **and** 
 agreement; declaring **human** needs only 0.60. A high `p_ai` produced by one signal alone
 therefore falls through to *uncertain* instead of accusing a human. A `0.51` confidence always
 lands in *uncertain*; a `0.95` clears a bar — the score meaningfully changes the outcome.
+
+### Two worked examples (meaningful variation, not a constant)
+
+Real numbers from the Milestone 4 pipeline test, showing a high- and a low-confidence case:
+
+**High-confidence** — an AI-generated economics paragraph. Both signals agree strongly:
+
+```
+llm_score = 0.90   sty_score = 0.92
+p_ai = 0.907   agreement = 0.983   confidence = 0.807
+→ verdict: likely-ai
+```
+
+**Low-confidence** — a formal *human* essay with unusually uniform sentences. The signals
+disagree (stylometry sees AI-like uniformity, the LLM reads it as human), so confidence collapses:
+
+```
+llm_score = 0.20   sty_score = 0.63
+p_ai = 0.371   agreement = 0.573   confidence = 0.203
+→ verdict: uncertain
+```
+
+`0.807` vs `0.203` — the score isn't a constant; agreement and distance-from-0.5 move it, and
+crucially the low-confidence human case lands in *uncertain* rather than a false AI accusation.
 
 ---
 
@@ -444,3 +515,85 @@ in the log.
 Note entries `id: 1` and `id: 4` share a `content_id`: the original AI classification, then the
 appeal against it (status now `under_review`) — the complete lifecycle of one contested piece,
 captured in the log.
+
+---
+
+## Known Limitations
+
+Perfect AI detection is an unsolved problem; the system is built to be *honest about
+uncertainty*, not perfect. Specific content it would likely get wrong, tied to properties of
+the signals:
+
+1. **Formal / structured human writing (false-positive risk).** Academic essays, legal or
+   corporate prose, and some polished non-native English writing use deliberately uniform
+   sentence lengths. Our primary stylometry metric is **sentence-length burstiness (CV)** —
+   uniform sentences produce a *low* CV, which the metric reads as AI-like. On our calibration
+   set exactly this happened: a human teacher-training essay scored `sty_score = 0.63`. It was
+   saved from a false accusation only because the LLM disagreed and the asymmetric threshold
+   routed it to *uncertain* — but a more uniform human sample where the LLM *also* leans AI
+   could be misclassified. This is a direct consequence of burstiness being a *structural*
+   proxy that can't tell disciplined human style from machine uniformity.
+
+2. **Lightly human-edited AI text (false-negative risk).** If someone generates text with an
+   LLM and then edits it — breaking up sentences, adding personal asides, varying punctuation —
+   they raise the burstiness (fooling the *structural* signal) and soften the generic voice
+   (fooling the *semantic* LLM signal). Because *both* signals key on surface properties that
+   editing changes, the pipeline will tend to score humanized AI as human or uncertain. We
+   accept this deliberately: missing some AI is preferable to falsely accusing humans.
+
+3. **Very short submissions (haiku, micro-fiction).** Below ~60 words the stylometry metrics
+   are statistically unstable (too few sentences for a meaningful CV), so the system returns
+   *uncertain* by design rather than guessing — correct behavior, but it means the tool simply
+   cannot serve short-form creative work.
+
+**If deploying for real**, the highest-value changes would be: replace the two heuristic
+stylometry metrics with a trained stylometric classifier (or a perplexity-based signal),
+key rate limits by authenticated creator rather than IP, and add a human-review queue UI
+behind the appeals workflow so `under_review` items actually get adjudicated.
+
+---
+
+## Spec Reflection
+
+**How the spec helped.** Writing [planning.md](planning.md) *before* code forced the hard
+decisions up front — specifically the **asymmetric confidence thresholds** and the **exact
+three label variants**. Because "AI needs confidence ≥ 0.75 **and** agreement; human needs
+0.60" existed on paper first, the scoring code was a direct translation with a clear target,
+and the false-positive asymmetry was baked in from the first line rather than retrofitted. The
+"decide what 0.5 *means* before the math" instruction similarly kept the confidence design
+grounded in user meaning instead of a formula chosen for convenience.
+
+**How the implementation diverged.** The spec's stylometry design used **three equally-weighted
+metrics** including type-token ratio (TTR). Implementation diverged: after calibrating against a
+labeled sample set, **TTR was dropped entirely** and burstiness/punctuation were reweighted
+0.75/0.25, and `MIN_WORDS` was raised 40 → 60. The reason was empirical — on real data TTR's
+direction was *reversed* (AI text had higher lexical diversity than long human essays), so the
+spec's assumption ("extreme uniformity reads AI-ish") didn't hold and keeping TTR would have
+caused false positives. The spec was right about the *approach* (structural metrics, tune later)
+but wrong about one *metric*, and the data settled it. (planning.md carries a note pointing to
+this as-built change.)
+
+---
+
+## AI Usage
+
+This project was built with AI assistance (Claude Code). Two concrete instances where I
+directed it and then revised or overrode the output:
+
+1. **Stylometry calibration — overrode the spec's metric set.** I directed the AI to implement
+   the stylometry signal per the spec (three metrics: burstiness, punctuation, TTR). It produced
+   a working version, but when I had it run the metrics over a labeled calibration set, the data
+   showed TTR was non-discriminating and *reversed* in direction. I directed it to drop TTR,
+   reweight toward burstiness, and recalibrate the bands — overriding the original spec based on
+   evidence rather than keeping the plausible-but-wrong metric.
+
+2. **Rate-limit values — rejected the AI's first numbers.** The AI initially set the limit to
+   `10/min; 100/day`, lifted from an example in the task description. I pushed back that those
+   were just a reference, and directed it to reason from *this* project's real usage (a writer
+   submits work infrequently; every submit is one Groq call). It re-derived a defensible
+   3-tier limit — `5/min; 30/hour; 100/day` — with per-tier justification, which I adopted.
+
+3. **Gradio frontend — corrected a version mismatch.** I directed the AI to build the Gradio UI.
+   Its first version passed `theme=` to the `Blocks()` constructor (valid in older Gradio); on
+   testing under Gradio 6 it surfaced a deprecation and I had it move `theme` to `launch()`, and
+   also add a 403-specific error hint after we hit the macOS AirPlay port conflict.
